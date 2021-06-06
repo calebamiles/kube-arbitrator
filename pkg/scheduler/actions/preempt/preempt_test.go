@@ -31,6 +31,9 @@ import (
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/framework"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/conformance"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/gang"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/nodeorder"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/predicates"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/priority"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/util"
 )
 
@@ -197,6 +200,144 @@ func TestPreempt(t *testing.T) {
 
 		if test.expected != len(evictor.Evicts) {
 			t.Errorf("case %d (%s): expected: %v, got %v ", i, test.name, test.expected, len(evictor.Evicts))
+		}
+	}
+}
+
+func TestPreemptInJobs(t *testing.T) {
+	framework.RegisterPluginBuilder("conformance", conformance.New)
+	framework.RegisterPluginBuilder("priority", priority.New)
+	framework.RegisterPluginBuilder("predicates", predicates.New)
+	framework.RegisterPluginBuilder("nodeorder", nodeorder.New)
+	defer framework.CleanupPluginBuilders()
+
+	highPriority, lowPriority := int32(2000), int32(100)
+	tests := []struct {
+		name      string
+		podGroups []*kbv1.PodGroup
+		pods      []*v1.Pod
+		nodes     []*v1.Node
+		queues    []*kbv1.Queue
+		expected  int
+	}{
+		{
+			name: "preempt in same jobs: can not preempt in same job",
+			podGroups: []*kbv1.PodGroup{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pg1",
+						Namespace: "c1",
+					},
+					Spec: kbv1.PodGroupSpec{
+						MinMember: 2,
+						Queue:     "q1",
+					},
+				},
+			},
+			pods: []*v1.Pod{
+				util.BuildPodWithPrio("c1", "preemptee1", "n1", v1.PodRunning, util.BuildResourceList("1000m", "1Gi"), "pg1", &lowPriority, make(map[string]string), make(map[string]string)),
+				util.BuildPodWithPrio("c1", "preemptee1", "n2", v1.PodRunning, util.BuildResourceList("1000m", "1Gi"), "pg1", &lowPriority, make(map[string]string), make(map[string]string)),
+				util.BuildPodWithPrio("c1", "preemptor1", "", v1.PodPending, util.BuildResourceList("1000m", "1Gi"), "pg1", &highPriority, make(map[string]string), make(map[string]string)),
+				util.BuildPodWithPrio("c1", "preemptor2", "", v1.PodPending, util.BuildResourceList("1000m", "1Gi"), "pg1", &highPriority, make(map[string]string), make(map[string]string)),
+			},
+			nodes: []*v1.Node{
+				util.BuildNode("n1", util.BuildResourceListWithPods("1000m", "1Gi", "100"), make(map[string]string)),
+				util.BuildNode("n2", util.BuildResourceListWithPods("1000m", "1Gi", "100"), make(map[string]string)),
+			},
+			queues: []*kbv1.Queue{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "q1",
+					},
+					Spec: kbv1.QueueSpec{
+						Weight: 1,
+					},
+				},
+			},
+			expected: 2,
+		},
+	}
+
+	preempt := New()
+	for j, test := range tests {
+		binder := &util.FakeBinder{
+			Binds:   map[string]string{},
+			Channel: make(chan string, test.expected),
+		}
+		evictor := &util.FakeEvictor{
+			Evicts:  make([]string, 0),
+			Channel: make(chan string, test.expected),
+		}
+		schedulerCache := &cache.SchedulerCache{
+			Nodes:         make(map[string]*api.NodeInfo),
+			Jobs:          make(map[api.JobID]*api.JobInfo),
+			Queues:        make(map[api.QueueID]*api.QueueInfo),
+			Binder:        binder,
+			Evictor:       evictor,
+			StatusUpdater: &util.FakeStatusUpdater{},
+			VolumeBinder:  &util.FakeVolumeBinder{},
+
+			Recorder: record.NewFakeRecorder(100),
+		}
+		for _, node := range test.nodes {
+			schedulerCache.AddNode(node)
+		}
+		for _, pod := range test.pods {
+			schedulerCache.AddPod(pod)
+		}
+
+		for _, ss := range test.podGroups {
+			schedulerCache.AddPodGroupAlpha1(ss)
+		}
+
+		for _, q := range test.queues {
+			schedulerCache.AddQueuev1alpha1(q)
+		}
+
+		trueValue := true
+		ssn := framework.OpenSession(schedulerCache, []conf.Tier{
+			{
+				Plugins: []conf.PluginOption{
+					{
+						Name:               "conformance",
+						EnabledPreemptable: &trueValue,
+					},
+					{
+						Name:               "priority",
+						EnabledJobOrder:    &trueValue,
+						EnabledTaskOrder:   &trueValue,
+						EnabledPreemptable: &trueValue,
+					},
+					{
+						Name:             "predicates",
+						EnabledPredicate: &trueValue,
+					},
+					{
+						Name:             "nodeorder",
+						EnabledNodeOrder: &trueValue,
+					},
+				},
+			},
+		})
+		defer framework.CloseSession(ssn)
+		preempt.Execute(ssn)
+
+		for i := 0; i < test.expected; i++ {
+			select {
+			case key := <-evictor.Channel:
+				t.Log("get evictee ", key)
+			case <-time.After(1 * time.Second):
+				t.Errorf("case %d %v: not enough evictions", j, test.name)
+			}
+		}
+		select {
+		case key, opened := <-evictor.Channel:
+			if opened {
+				t.Errorf("case %d [%v]: unexpected eviction: %s", j, test.name, key)
+			}
+		case <-time.After(300 * time.Millisecond):
+			// TODO: Active waiting here is not optimal, but there is no better way currently.
+			//	 Ideally we would like to wait for evict and bind request goroutines to finish first.
 		}
 	}
 }
