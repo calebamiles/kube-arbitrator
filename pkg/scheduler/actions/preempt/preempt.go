@@ -60,7 +60,7 @@ func (alloc *preemptAction) Execute(ssn *framework.Session) {
 			queues[queue.UID] = queue
 		}
 
-		if len(job.TaskStatusIndex[api.Pending]) != 0 {
+		if len(job.TaskStatusIndex[api.Pending]) != 0 /*&& !ssn.JobPipelined(job)*/ {
 			if _, found := preemptorsMap[job.Queue]; !found {
 				preemptorsMap[job.Queue] = util.NewPriorityQueue(ssn.JobOrderFn)
 			}
@@ -89,6 +89,10 @@ func (alloc *preemptAction) Execute(ssn *framework.Session) {
 			stmt := ssn.Statement()
 			assigned := false
 			for {
+				// If job is pipelined, then stop preempting.
+				if ssn.JobPipelined(preemptorJob) {
+					break
+				}
 				// If not preemptor tasks, next job.
 				if preemptorTasks[preemptorJob.UID].Empty() {
 					glog.V(3).Infof("No preemptor task in job <%s/%s>.",
@@ -134,6 +138,11 @@ func (alloc *preemptAction) Execute(ssn *framework.Session) {
 
 		// Preemption between Task within Job.
 		for _, job := range underRequest {
+			// Fix: missing preemptor numbers when in same job
+			preemptorTasks[job.UID] = util.NewPriorityQueue(ssn.TaskOrderFn)
+			for _, task := range job.TaskStatusIndex[api.Pending] {
+				preemptorTasks[job.UID].Push(task)
+			}
 			for {
 				if _, found := preemptorTasks[job.UID]; !found {
 					break
@@ -205,7 +214,7 @@ func preempt(
 		victims := ssn.Preemptable(preemptor, preemptees)
 		metrics.UpdatePreemptionVictimsCount(len(victims))
 
-		if err := validateVictims(victims, resreq); err != nil {
+		if err := validateVictims(victims, node, resreq); err != nil {
 			glog.V(3).Infof("No validated victims on Node <%s>: %v", node.Name, err)
 			continue
 		}
@@ -218,6 +227,10 @@ func preempt(
 		}
 		// Preempt victims for tasks, pick lowest priority task first.
 		for !victimsQueue.Empty() {
+			// If reclaimed enough resources, break loop to avoid Sub panic.
+			if preemptor.InitResreq.LessEqual(node.FutureIdle()) {
+				break
+			}
 			preemptee := victimsQueue.Pop().(*api.TaskInfo)
 			glog.Errorf("Try to preempt Task <%s/%s> for Tasks <%s/%s>",
 				preemptee.Namespace, preemptee.Name, preemptor.Namespace, preemptor.Name)
@@ -227,17 +240,13 @@ func preempt(
 				continue
 			}
 			preempted.Add(preemptee.Resreq)
-			// If reclaimed enough resources, break loop to avoid Sub panic.
-			if resreq.LessEqual(preempted) {
-				break
-			}
 		}
 
 		metrics.RegisterPreemptionAttempts()
 		glog.V(3).Infof("Preempted <%v> for task <%s/%s> requested <%v>.",
 			preempted, preemptor.Namespace, preemptor.Name, preemptor.InitResreq)
 
-		if preemptor.InitResreq.LessEqual(preempted) {
+		if preemptor.InitResreq.LessEqual(node.FutureIdle()) {
 			if err := stmt.Pipeline(preemptor, node.Name); err != nil {
 				glog.Errorf("Failed to pipline Task <%s/%s> on Node <%s>",
 					preemptor.Namespace, preemptor.Name, node.Name)
@@ -253,13 +262,14 @@ func preempt(
 	return assigned, nil
 }
 
-func validateVictims(victims []*api.TaskInfo, resreq *api.Resource) error {
+func validateVictims(victims []*api.TaskInfo, node *api.NodeInfo, resreq *api.Resource) error {
 	if len(victims) == 0 {
 		return fmt.Errorf("no victims")
 	}
 
 	// If not enough resource, continue
 	allRes := api.EmptyResource()
+	allRes.Add(node.FutureIdle())
 	for _, v := range victims {
 		allRes.Add(v.Resreq)
 	}

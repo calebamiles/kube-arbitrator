@@ -48,6 +48,13 @@ func BuildResourceListWithGPU(cpu string, memory string, GPU string) v1.Resource
 	}
 }
 
+// BuildResourceListWithPods builts resource list with PODs
+func BuildResourceListWithPods(cpu, memory string, pods string) v1.ResourceList {
+	r := BuildResourceList(cpu, memory)
+	r[v1.ResourcePods] = resource.MustParse(pods)
+	return r
+}
+
 // BuildNode builts node object
 func BuildNode(name string, alloc v1.ResourceList, labels map[string]string) *v1.Node {
 	return &v1.Node{
@@ -89,6 +96,13 @@ func BuildPod(namespace, name, nodename string, p v1.PodPhase, req v1.ResourceLi
 			},
 		},
 	}
+}
+
+// BuildPodWithPrio build pod with a priority
+func BuildPodWithPrio(namespace, name, nodename string, p v1.PodPhase, req v1.ResourceList, groupName string, prio *int32, labels map[string]string, selector map[string]string) *v1.Pod {
+	pod := BuildPod(namespace, name, nodename, p, req, groupName, labels, selector)
+	pod.Spec.Priority = prio
+	return pod
 }
 
 // FakeBinder is used as fake binder
